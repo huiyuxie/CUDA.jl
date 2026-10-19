@@ -45,7 +45,6 @@ function cufftMakePlan(output_type::Type{<:cufftNumber}, input_type::Type{<:cuff
     nrank = length(region)
 
     sz = ntuple((d) -> input_size[region[d]], nrank)
-    csz = ntuple((d) -> (d==1) ? div(input_size[region[d]], 2) + 1 : input_size[region[d]], nrank)
 
     # all sizes which are not part of the dimensions specified by region are batch dimensions.
     num_internal_batches = prod(input_size) ÷ prod(sz)
@@ -56,6 +55,25 @@ function cufftMakePlan(output_type::Type{<:cufftNumber}, input_type::Type{<:cuff
     rsz = length(sz) > 1 ? reverse(sz) : sz
     if nrank > 3
         throw(ArgumentError("only up to three transform dimensions are allowed in one plan"))
+    end
+
+    # Plans still execute on dense arrays (including staged views). Use the same
+    # stride-to-layout conversion that future direct view plans can build on.
+    # Keep the simple-layout path below: NULL embeddings ignore advanced strides.
+    if region !== ntuple(identity, nrank)
+        internal_batch_dims, _ = get_batch_dims(region, input_size)
+        xdims = output_type <: Real ? cdims : input_size
+        ydims = input_type <: Real ? cdims : input_size
+        input_layout = cufft_layout(xdims, Base.size_to_strides(1, xdims...), region, internal_batch_dims)
+        output_layout = cufft_layout(ydims, Base.size_to_strides(1, ydims...), region, internal_batch_dims)
+        @assert input_layout !== nothing && output_layout !== nothing
+        inembed = Clonglong[input_layout.embed...]
+        onembed = Clonglong[output_layout.embed...]
+        # The outermost embedding does not affect addresses, but must cover the
+        # full transform length even on the shortened complex side of R2C/C2R.
+        inembed[1] = max(inembed[1], rsz[1])
+        onembed[1] = max(onembed[1], rsz[1])
+        num_internal_batches = prod(input_size[collect(internal_batch_dims)])
     end
 
     # initialize the plan handle
@@ -72,39 +90,12 @@ function cufftMakePlan(output_type::Type{<:cufftNumber}, input_type::Type{<:cuff
                             C_NULL, 1, 1, convert(cudaDataType, output_type),
                             num_internal_batches, worksize_ref, convert(cudaDataType, execution_type))
     else
-        # reduce the array to the final transform direction.
-        # This situation will be picked up in the application of the plan later 
-        # so the plan needs to only include internal dims.
-        internal_batch_dims, external_batch_dims = get_batch_dims(region, input_size)
-
-        # Stride between consecutive elements in the innermost transform dim
-        istride = prod(input_size[1:region[1]-1])
-        # The internal batching is over the largest consecutive batch indices.
-        # Since they are consecutive they can all be batched by a single batch_stride "i_dist".
-        # Distance between consecutive internal batches
-        idist = prod(input_size[1:internal_batch_dims[1]-1])
-        cdist = prod(cdims[1:internal_batch_dims[1]-1])
-
-        # Embedded storage sizes (C-order): cuFFT requires the first entry >= n[0]
-        # (the outermost transform size, which in C-order is rsz[1]). Use idist when
-        # it already satisfies this; otherwise pad up to n[0].
-        # Remaining entries are products of sizes between consecutive transform dims.
-        inembed = Clonglong[max(idist, rsz[1]), (prod(input_size[region[i]:region[i+1]-1]) for i in nrank-1:-1:1)...]
-        cnembed = Clonglong[max(cdist, rsz[1]), (prod(cdims[region[i]:region[i+1]-1]) for i in nrank-1:-1:1)...]
-
-        num_internal_batches = prod(input_size[collect(internal_batch_dims)])
-
-        ostride = istride
-        # R2C: output uses half-complex layout; C2R: input uses half-complex layout
-        onembed, odist = input_type <: Real ? (cnembed, cdist) : (inembed, idist)
-        if output_type <: Real
-            inembed, idist = cnembed, cdist
-        end
-
+        # External batches are handled when applying the plan; cuFFT only sees
+        # the transform dimensions and the selected internal batch dimensions.
         execution_type = promote_type(input_type, output_type)
         cufftXtMakePlanMany(handle, nrank, Clonglong[rsz...],
-                            inembed, istride, idist, convert(cudaDataType, input_type),
-                            onembed, ostride, odist, convert(cudaDataType, output_type),
+                            inembed, input_layout.stride, input_layout.dist, convert(cudaDataType, input_type),
+                            onembed, output_layout.stride, output_layout.dist, convert(cudaDataType, output_type),
                             num_internal_batches, worksize_ref, convert(cudaDataType, execution_type))
     end
 
