@@ -27,6 +27,7 @@ include("libcufft.jl")
 # low-level wrappers
 include("error.jl")
 include("util.jl")
+include("layout.jl")
 include("wrappers.jl")
 
 # high-level integrations
